@@ -1,0 +1,13 @@
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/rust:1-1-bookworm
+    command: /bin/sh -c "while sleep 1000; do :; done"
+    volumes:
+      - .:/workspace:cached
+  postgres:
+    image: postgres:17.5-bookworm
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: test
+
