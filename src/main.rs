@@ -464,16 +464,18 @@ async fn tokio_postgres_insert(
 
     let start = std::time::Instant::now();
     for authors in &generator.chunks(chunk_size) {
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> =
-            Vec::with_capacity(chunk_size * 3);
-        for author in authors {
-            params.push(Box::new(author.id));
-            params.push(Box::new(author.name));
-            params.push(Box::new(author.bio));
-        }
-        let param_ref = params.iter().map(|p| p.as_ref()).collect::<Vec<_>>();
+        let authors: Vec<Author> = authors.collect();
 
-        client.execute(&statement, &param_ref).await.unwrap();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            Vec::with_capacity(chunk_size * 3);
+
+        for author in authors.iter() {
+            params.push(&author.id);
+            params.push(&author.name);
+            params.push(&author.bio);
+        }
+
+        client.execute(&statement, &params).await.unwrap();
     }
 
     start.elapsed()
