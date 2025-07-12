@@ -266,12 +266,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
 
 [[package]]
-name = "fastrand"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -621,6 +615,15 @@ dependencies = [
  "bitflags",
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
 ]
 
 [[package]]
@@ -1437,39 +1440,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "test-context"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb69cce03e432993e2dc1f93f7899b952300fcb6dc44191a1b830b60b8c3c8aa"
-dependencies = [
- "futures",
- "test-context-macros",
-]
-
-[[package]]
-name = "test-context-macros"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97e0639209021e54dbe19cafabfc0b5574b078c37358945e6d473eabe39bb974"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "test-utils"
-version = "0.1.0"
-dependencies = [
- "fastrand",
- "sqlx",
- "test-context",
- "tokio",
- "tokio-postgres",
- "url",
-]
-
-[[package]]
 name = "thiserror"
 version = "2.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1949,10 +1919,10 @@ dependencies = [
 name = "workspace"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
+ "itertools",
  "sqlx",
- "test-context",
- "test-utils",
  "tokio",
  "tokio-postgres",
  "url",

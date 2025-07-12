@@ -1,16 +1,12 @@
+use futures::SinkExt;
+use itertools::Itertools as _;
 use std::ops::DerefMut;
+use tokio_postgres::CopyInSink;
 
 use sqlx::{
     PgConnection, PgPool,
     postgres::{PgArgumentBuffer, PgCopyIn, Postgres},
 };
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct Author {
-    id: i64,
-    name: String,
-    bio: Option<String>,
-}
 
 struct CopyDataSink<C: DerefMut<Target = PgConnection>> {
     encode_buf: PgArgumentBuffer,
@@ -88,6 +84,24 @@ impl<C: DerefMut<Target = PgConnection>> CopyDataSink<C> {
         Ok(())
     }
 }
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Author {
+    id: i64,
+    name: String,
+    bio: Option<String>,
+}
+
+impl Author {
+    fn to_text(&self) -> String {
+        let bio = self.bio.as_deref().unwrap_or("\\N");
+        format!("{}\t{}\t{}", self.id, self.name, bio)
+    }
+
+    fn to_csv(&self) -> String {
+        let bio = self.bio.as_deref().unwrap_or("");
+        format!("{},{},{}", self.id, self.name, bio)
+    }
+}
 
 struct AuthorGenerator {
     current: usize,
@@ -155,6 +169,98 @@ async fn sqlx_binary_copy_in(pool: &PgPool, count: usize) -> std::time::Duration
     start.elapsed()
 }
 
+async fn sqlx_text_copy_in(pool: &PgPool, count: usize) -> std::time::Duration {
+    let mut conn = pool.acquire().await.unwrap();
+
+    // テーブルをクリア
+    sqlx::query("TRUNCATE authors")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+
+    let mut copy_in = conn
+        .copy_in_raw("COPY authors (id, name, bio) FROM STDIN (FORMAT TEXT)")
+        .await
+        .unwrap();
+
+    // ストリーミングでデータを処理
+    let generator = AuthorGenerator::new(count).take(count);
+    for authors in &generator.chunks(100) {
+        let mut data = authors.map(|x| x.to_text()).join("\n");
+        data.push('\n');
+
+        copy_in.send(data.as_bytes()).await.unwrap();
+    }
+
+    copy_in.finish().await.unwrap();
+
+    start.elapsed()
+}
+
+async fn sqlx_csv_copy_in(pool: &PgPool, count: usize) -> std::time::Duration {
+    let mut conn = pool.acquire().await.unwrap();
+
+    // テーブルをクリア
+    sqlx::query("TRUNCATE authors")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+
+    let mut copy_in = conn
+        .copy_in_raw("COPY authors (id, name, bio) FROM STDIN (FORMAT CSV)")
+        .await
+        .unwrap();
+
+    // ストリーミングでデータを処理
+    let generator = AuthorGenerator::new(count).take(count);
+    for authors in &generator.chunks(100) {
+        let mut data = authors.map(|x| x.to_csv()).join("\n");
+        data.push('\n');
+
+        copy_in.send(data.as_bytes()).await.unwrap();
+    }
+
+    copy_in.finish().await.unwrap();
+
+    start.elapsed()
+}
+
+async fn sqlx_unnest(pool: &PgPool, count: usize) -> std::time::Duration {
+    let mut conn = pool.acquire().await.unwrap();
+
+    // テーブルをクリア
+    sqlx::query("TRUNCATE authors")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let generator = AuthorGenerator::new(count).take(count);
+    let mut ids: Vec<i64> = Vec::with_capacity(count);
+    let mut names: Vec<String> = Vec::with_capacity(count);
+    let mut bios: Vec<Option<String>> = Vec::with_capacity(count);
+
+    for author in generator {
+        ids.push(author.id);
+        names.push(author.name);
+        bios.push(author.bio);
+    }
+
+    let start = std::time::Instant::now();
+    sqlx::query("INSERT INTO authors (id, name, bio) SELECT unnest($1::BIGINT[]), unnest($2::TEXT[]), unnest($3::TEXT[])")
+        .bind(ids)
+        .bind(names)
+        .bind(bios)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    start.elapsed()
+}
+
 async fn tokio_postgres_binary_copy_in(
     client: &tokio_postgres::Client,
     count: usize,
@@ -182,6 +288,89 @@ async fn tokio_postgres_binary_copy_in(
     }
 
     writer.finish().await.unwrap();
+
+    start.elapsed()
+}
+
+async fn tokio_postgres_text_copy_in(
+    client: &tokio_postgres::Client,
+    count: usize,
+) -> std::time::Duration {
+    client.batch_execute("TRUNCATE authors").await.unwrap();
+
+    let start = std::time::Instant::now();
+
+    let copy_in: CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY authors (id, name, bio) FROM STDIN (FORMAT TEXT)")
+        .await
+        .unwrap();
+    tokio::pin!(copy_in);
+
+    let generator = AuthorGenerator::new(count).take(count);
+    for authors in &generator.chunks(100) {
+        let mut data = authors.map(|x| x.to_text()).join("\n");
+        data.push('\n');
+
+        copy_in.send(data.into()).await.unwrap();
+    }
+
+    copy_in.close().await.unwrap();
+
+    start.elapsed()
+}
+
+async fn tokio_postgres_csv_copy_in(
+    client: &tokio_postgres::Client,
+    count: usize,
+) -> std::time::Duration {
+    client.batch_execute("TRUNCATE authors").await.unwrap();
+
+    let start = std::time::Instant::now();
+
+    let copy_in: CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY authors (id, name, bio) FROM STDIN (FORMAT CSV)")
+        .await
+        .unwrap();
+    tokio::pin!(copy_in);
+
+    let generator = AuthorGenerator::new(count).take(count);
+    for authors in &generator.chunks(100) {
+        let mut data = authors.map(|x| x.to_csv()).join("\n");
+        data.push('\n');
+
+        copy_in.send(data.into()).await.unwrap();
+    }
+
+    copy_in.close().await.unwrap();
+
+    start.elapsed()
+}
+
+async fn tokio_postgres_unnest(
+    client: &tokio_postgres::Client,
+    count: usize,
+) -> std::time::Duration {
+    client.batch_execute("TRUNCATE authors").await.unwrap();
+
+    let generator = AuthorGenerator::new(count).take(count);
+    let mut ids: Vec<i64> = Vec::with_capacity(count);
+    let mut names: Vec<String> = Vec::with_capacity(count);
+    let mut bios: Vec<Option<String>> = Vec::with_capacity(count);
+
+    for author in generator {
+        ids.push(author.id);
+        names.push(author.name);
+        bios.push(author.bio);
+    }
+
+    let start = std::time::Instant::now();
+    client
+        .execute(
+            "INSERT INTO authors (id, name, bio) SELECT unnest($1::BIGINT[]), unnest($2::TEXT[]), unnest($3::TEXT[])",
+            &[&ids, &names, &bios],
+        )
+        .await
+        .unwrap();
 
     start.elapsed()
 }
@@ -241,13 +430,45 @@ async fn main() {
     });
     migrate_db(&client).await.unwrap();
 
-    let count = 1;
-    let duration_sqlx = sqlx_binary_copy_in(&pool, count).await;
-    println!("sqlx binary copy in took: {}ms", duration_sqlx.as_millis());
+    let count = 1_000_000;
+    let duration_sqlx_binary = sqlx_binary_copy_in(&pool, count).await;
+    println!(
+        "sqlx binary copy in took: {}ms",
+        duration_sqlx_binary.as_millis()
+    );
 
-    let duration_tokio_postgres = tokio_postgres_binary_copy_in(&client, count).await;
+    let duration_sqlx_text = sqlx_text_copy_in(&pool, count).await;
+    println!(
+        "sqlx text copy in took: {}ms",
+        duration_sqlx_text.as_millis()
+    );
+
+    let duration_sqlx_csv = sqlx_csv_copy_in(&pool, count).await;
+    println!("sqlx csv copy in took: {}ms", duration_sqlx_csv.as_millis());
+
+    let duration_sqlx_unnest = sqlx_unnest(&pool, count).await;
+    println!("sqlx unnest took: {}ms", duration_sqlx_unnest.as_millis());
+
+    let duration_tokio_postgres_binary = tokio_postgres_binary_copy_in(&client, count).await;
     println!(
         "tokio-postgres binary copy in took: {}ms",
-        duration_tokio_postgres.as_millis()
+        duration_tokio_postgres_binary.as_millis()
+    );
+
+    let duration_tokio_postgres_text = tokio_postgres_text_copy_in(&client, count).await;
+    println!(
+        "tokio-postgres text copy in took: {}ms",
+        duration_tokio_postgres_text.as_millis()
+    );
+    let duration_tokio_postgres_csv = tokio_postgres_csv_copy_in(&client, count).await;
+    println!(
+        "tokio-postgres csv copy in took: {}ms",
+        duration_tokio_postgres_csv.as_millis()
+    );
+
+    let duration_tokio_postgres_unnest = tokio_postgres_unnest(&client, count).await;
+    println!(
+        "tokio-postgres unnest took: {}ms",
+        duration_tokio_postgres_unnest.as_millis()
     );
 }
