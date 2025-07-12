@@ -8,6 +8,7 @@ use sqlx::{
     postgres::{PgArgumentBuffer, PgCopyIn, Postgres},
 };
 
+const BUFFER_SIZE: usize = 4096;
 struct CopyDataSink<C: DerefMut<Target = PgConnection>> {
     encode_buf: PgArgumentBuffer,
     data_buf: Vec<u8>,
@@ -18,7 +19,7 @@ type BoxError = Box<dyn std::error::Error + 'static + Send + Sync>;
 
 impl<C: DerefMut<Target = PgConnection>> CopyDataSink<C> {
     fn new(copy_in: PgCopyIn<C>) -> Self {
-        let mut data_buf = Vec::with_capacity(1024);
+        let mut data_buf = Vec::with_capacity(BUFFER_SIZE * 2);
         const COPY_SIGNATURE: &[u8] = &[
             b'P', b'G', b'C', b'O', b'P', b'Y', b'\n', // "PGCOPY\n"
             0xFF,  // \377 (8進数) = 0xFF (16進数)
@@ -77,7 +78,7 @@ impl<C: DerefMut<Target = PgConnection>> CopyDataSink<C> {
 
         self.encode_buf.clear();
 
-        if self.data_buf.len() > 4096 {
+        if self.data_buf.len() > BUFFER_SIZE {
             self.send().await?;
         }
 
@@ -94,12 +95,12 @@ struct Author {
 impl Author {
     fn to_text(&self) -> String {
         let bio = self.bio.as_deref().unwrap_or("\\N");
-        format!("{}\t{}\t{}", self.id, self.name, bio)
+        format!("{}\t{}\t{}\n", self.id, self.name, bio)
     }
 
     fn to_csv(&self) -> String {
         let bio = self.bio.as_deref().unwrap_or("");
-        format!("{},{},{}", self.id, self.name, bio)
+        format!("{},{},{}\n", self.id, self.name, bio)
     }
 }
 
@@ -135,6 +136,27 @@ impl Iterator for AuthorGenerator {
         let author = Self::generate_author(self.current);
         self.current += 1;
         Some(author)
+    }
+}
+
+async fn buffered_copy_in<F, C>(generator: impl Iterator<Item = Author>, coverter: C, mut f: F)
+where
+    C: Fn(Author) -> String,
+    F: AsyncFnMut(bytes::Bytes),
+{
+    let mut buf = bytes::BytesMut::with_capacity(BUFFER_SIZE * 2);
+    for author in generator {
+        let data = coverter(author);
+        buf.extend_from_slice(data.as_bytes());
+
+        if buf.len() >= BUFFER_SIZE {
+            let bytes = buf.split().freeze();
+            f(bytes).await;
+        }
+    }
+    if !buf.is_empty() {
+        let bytes = buf.split().freeze();
+        f(bytes).await;
     }
 }
 
@@ -187,12 +209,14 @@ async fn sqlx_text_copy_in(pool: &PgPool, count: usize) -> std::time::Duration {
 
     // ストリーミングでデータを処理
     let generator = AuthorGenerator::new(count).take(count);
-    for authors in &generator.chunks(100) {
-        let mut data = authors.map(|x| x.to_text()).join("\n");
-        data.push('\n');
-
-        copy_in.send(data.as_bytes()).await.unwrap();
-    }
+    buffered_copy_in(
+        generator,
+        |author| author.to_text(),
+        async |buf| {
+            copy_in.send(buf).await.unwrap();
+        },
+    )
+    .await;
 
     copy_in.finish().await.unwrap();
 
@@ -217,12 +241,14 @@ async fn sqlx_csv_copy_in(pool: &PgPool, count: usize) -> std::time::Duration {
 
     // ストリーミングでデータを処理
     let generator = AuthorGenerator::new(count).take(count);
-    for authors in &generator.chunks(100) {
-        let mut data = authors.map(|x| x.to_csv()).join("\n");
-        data.push('\n');
-
-        copy_in.send(data.as_bytes()).await.unwrap();
-    }
+    buffered_copy_in(
+        generator,
+        |author| author.to_csv(),
+        async |buf| {
+            copy_in.send(buf).await.unwrap();
+        },
+    )
+    .await;
 
     copy_in.finish().await.unwrap();
 
@@ -257,6 +283,40 @@ async fn sqlx_unnest(pool: &PgPool, count: usize) -> std::time::Duration {
         .execute(&mut *conn)
         .await
         .unwrap();
+
+    start.elapsed()
+}
+
+async fn sqlx_insert(pool: &PgPool, count: usize) -> std::time::Duration {
+    let mut conn = pool.acquire().await.unwrap();
+
+    // テーブルをクリア
+    sqlx::query("TRUNCATE authors")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let generator = AuthorGenerator::new(count).take(count);
+
+    let chunk_size = 10000;
+    assert!(count % chunk_size == 0);
+
+    let mut query = String::from("INSERT INTO authors (id, name, bio) VALUES ");
+    let parameters = (0..chunk_size)
+        .map(|i| format!("(${}, ${}, ${})", i * 3 + 1, i * 3 + 2, i * 3 + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    query.push_str(&parameters);
+
+    let start = std::time::Instant::now();
+    for authors in &generator.chunks(chunk_size) {
+        let mut q = sqlx::query(&query);
+        for author in authors {
+            q = q.bind(author.id).bind(author.name).bind(author.bio);
+        }
+
+        q.execute(&mut *conn).await.unwrap();
+    }
 
     start.elapsed()
 }
@@ -307,12 +367,14 @@ async fn tokio_postgres_text_copy_in(
     tokio::pin!(copy_in);
 
     let generator = AuthorGenerator::new(count).take(count);
-    for authors in &generator.chunks(100) {
-        let mut data = authors.map(|x| x.to_text()).join("\n");
-        data.push('\n');
-
-        copy_in.send(data.into()).await.unwrap();
-    }
+    buffered_copy_in(
+        generator,
+        |author| author.to_text(),
+        async |buf| {
+            copy_in.send(buf).await.unwrap();
+        },
+    )
+    .await;
 
     copy_in.close().await.unwrap();
 
@@ -334,12 +396,14 @@ async fn tokio_postgres_csv_copy_in(
     tokio::pin!(copy_in);
 
     let generator = AuthorGenerator::new(count).take(count);
-    for authors in &generator.chunks(100) {
-        let mut data = authors.map(|x| x.to_csv()).join("\n");
-        data.push('\n');
-
-        copy_in.send(data.into()).await.unwrap();
-    }
+    buffered_copy_in(
+        generator,
+        |author| author.to_csv(),
+        async |buf| {
+            copy_in.send(buf).await.unwrap();
+        },
+    )
+    .await;
 
     copy_in.close().await.unwrap();
 
@@ -371,6 +435,46 @@ async fn tokio_postgres_unnest(
         )
         .await
         .unwrap();
+
+    start.elapsed()
+}
+
+async fn tokio_postgres_insert(
+    client: &tokio_postgres::Client,
+    count: usize,
+) -> std::time::Duration {
+    client.batch_execute("TRUNCATE authors").await.unwrap();
+
+    let generator = AuthorGenerator::new(count).take(count);
+
+    let chunk_size = 10000;
+    assert!(count % chunk_size == 0);
+
+    let mut query = String::from("INSERT INTO authors (id, name, bio) VALUES ");
+    let parameters = (0..chunk_size)
+        .map(|i| format!("(${}, ${}, ${})", i * 3 + 1, i * 3 + 2, i * 3 + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    query.push_str(&parameters);
+
+    let statement = client
+        .prepare(&query)
+        .await
+        .expect("Failed to prepare statement");
+
+    let start = std::time::Instant::now();
+    for authors in &generator.chunks(chunk_size) {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> =
+            Vec::with_capacity(chunk_size * 3);
+        for author in authors {
+            params.push(Box::new(author.id));
+            params.push(Box::new(author.name));
+            params.push(Box::new(author.bio));
+        }
+        let param_ref = params.iter().map(|p| p.as_ref()).collect::<Vec<_>>();
+
+        client.execute(&statement, &param_ref).await.unwrap();
+    }
 
     start.elapsed()
 }
@@ -415,6 +519,22 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), BoxError> {
     Ok(())
 }
 
+async fn benchmark_with_stats<F, Fut>(runs: usize, f: F) -> std::time::Duration
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::time::Duration>,
+{
+    let mut durations = Vec::new();
+    for _ in 0..runs {
+        durations.push(f().await);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await; // クールダウン
+    }
+
+    let total_duration: std::time::Duration = durations.iter().sum();
+
+    total_duration / runs as u32
+}
+
 #[tokio::main]
 async fn main() {
     let pool = PgPool::connect(DATABASE_URL).await.unwrap();
@@ -431,44 +551,62 @@ async fn main() {
     migrate_db(&client).await.unwrap();
 
     let count = 1_000_000;
-    let duration_sqlx_binary = sqlx_binary_copy_in(&pool, count).await;
+    let runs = 5;
+
+    let duration_sqlx_binary =
+        benchmark_with_stats(runs, || sqlx_binary_copy_in(&pool, count)).await;
     println!(
         "sqlx binary copy in took: {}ms",
         duration_sqlx_binary.as_millis()
     );
 
-    let duration_sqlx_text = sqlx_text_copy_in(&pool, count).await;
+    let duration_sqlx_text = benchmark_with_stats(runs, || sqlx_text_copy_in(&pool, count)).await;
     println!(
         "sqlx text copy in took: {}ms",
         duration_sqlx_text.as_millis()
     );
 
-    let duration_sqlx_csv = sqlx_csv_copy_in(&pool, count).await;
+    let duration_sqlx_csv = benchmark_with_stats(runs, || sqlx_csv_copy_in(&pool, count)).await;
     println!("sqlx csv copy in took: {}ms", duration_sqlx_csv.as_millis());
 
-    let duration_sqlx_unnest = sqlx_unnest(&pool, count).await;
+    let duration_sqlx_unnest = benchmark_with_stats(runs, || sqlx_unnest(&pool, count)).await;
     println!("sqlx unnest took: {}ms", duration_sqlx_unnest.as_millis());
 
-    let duration_tokio_postgres_binary = tokio_postgres_binary_copy_in(&client, count).await;
+    let duration_sqlx_insert = benchmark_with_stats(runs, || sqlx_insert(&pool, count)).await;
+    println!("sqlx insert took: {}ms", duration_sqlx_insert.as_millis());
+
+    let duration_tokio_postgres_binary =
+        benchmark_with_stats(runs, || tokio_postgres_binary_copy_in(&client, count)).await;
     println!(
         "tokio-postgres binary copy in took: {}ms",
         duration_tokio_postgres_binary.as_millis()
     );
 
-    let duration_tokio_postgres_text = tokio_postgres_text_copy_in(&client, count).await;
+    let duration_tokio_postgres_text =
+        benchmark_with_stats(runs, || tokio_postgres_text_copy_in(&client, count)).await;
     println!(
         "tokio-postgres text copy in took: {}ms",
         duration_tokio_postgres_text.as_millis()
     );
-    let duration_tokio_postgres_csv = tokio_postgres_csv_copy_in(&client, count).await;
+
+    let duration_tokio_postgres_csv =
+        benchmark_with_stats(runs, || tokio_postgres_csv_copy_in(&client, count)).await;
     println!(
         "tokio-postgres csv copy in took: {}ms",
         duration_tokio_postgres_csv.as_millis()
     );
 
-    let duration_tokio_postgres_unnest = tokio_postgres_unnest(&client, count).await;
+    let duration_tokio_postgres_unnest =
+        benchmark_with_stats(runs, || tokio_postgres_unnest(&client, count)).await;
     println!(
         "tokio-postgres unnest took: {}ms",
         duration_tokio_postgres_unnest.as_millis()
+    );
+
+    let duration_tokio_postgres_insert =
+        benchmark_with_stats(runs, || tokio_postgres_insert(&client, count)).await;
+    println!(
+        "tokio-postgres insert took: {}ms",
+        duration_tokio_postgres_insert.as_millis()
     );
 }
