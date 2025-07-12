@@ -4,3 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+sqlx = { workspace = true }
+futures = "0.3.31"
+url = "2.5.4"
+
+[dev-dependencies]
+test-context = { workspace = true }
+test-utils = { workspace = true }
+
+
+[workspace.dependencies]
+tokio = { version = "1.46.1", features = ["full"] }
+tokio-postgres = { version = "0.7.13" }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
+test-context = "0.4.1"
+test-utils = { path = "test-utils" }
